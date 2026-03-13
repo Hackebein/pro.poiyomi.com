@@ -1,0 +1,1155 @@
+openapi: 3.1.0
+info:
+  title: Poiyomi Pro API (Reverse-Engineered)
+  version: 0.0.0-rev.1
+  summary: Poiyomi Pro API which got reverse-engineered from the Unity installer and web client bundles.
+  description: |
+    Authentication flow:
+
+    Unity and website authentication uses one shared Patreon OAuth pipeline.
+    The difference is the entry point and where the browser redirects after auth.
+
+    1. Unity path only: installer calls `POST /startUnityAuth` with `data.version` and gets `sessionId`.
+    2. Browser entry:
+       - Unity path: opens `/unity-auth?sessionId=<sessionId>`
+       - Website path: opens `/login` (or auth modal login button)
+    3. Browser prepares OAuth state:
+       - Website path: random UUID -> `sessionStorage.oauth_session_id`
+       - Unity path: reuse Unity `sessionId` as OAuth state and set
+         `sessionStorage.oauth_session_id=<sessionId>` plus `sessionStorage.oauth_is_unity=true`
+    4. Browser redirects to Patreon OAuth authorize URL with:
+       - `response_type=code`
+       - `client_id=iJRpvXZl5kF5p_KkpE6D8x8vnBJolOGgQp6WjLBo3JQMbUSapqF-kZeuR5uUGKkL`
+       - `redirect_uri=<origin>/auth/callback`
+       - `scope=identity identity[email] identity.memberships`
+       - `state=<stored-state>`
+       - `prompt=consent`
+    5. Patreon redirects to `/auth/callback?code=...&state=...`.
+    6. Callback validates `code`/`state` and checks `state == sessionStorage.oauth_session_id`.
+    7. Callback calls `POST /handlePatreonCallback` with
+       `{"data":{"code":"<code>","sessionId":"<state>"}}`.
+    9. Status routing:
+       - `active_patron` or `admin`:
+         - Website path -> `/success` (or close popup)
+         - Unity path -> `/unity-success?sessionId=<state>`
+       - `insufficient_tier` -> `/upgrade-tier?tier=<tier>`
+       - `not_a_patron` -> `/not-a-patron` (Unity path appends `?unity=true`)
+    10. Unity completion:
+       - Installer polls `POST /checkUnityAuth` until `completed` (`downloadUrl`) or `failed` (`error`).
+       - If browser is already authenticated with access on `/unity-auth`, it may call
+         `POST /completeUnityAuthDirect` for immediate session completion.
+  license:
+    name: Proprietary
+servers:
+  - url: https://us-central1-poiyomi-pro-site.cloudfunctions.net
+    description: Poiyomi Pro Live
+tags:
+  - name: UnityAuth
+    description: Unity/browser session bootstrap and polling endpoints.
+  - name: Releases
+    description: Release listing and signed package download URL generation.
+  - name: PatreonAuth
+    description: OAuth callback and entitlement-related auth completion.
+  - name: Account
+    description: Authenticated account link/unlink operations.
+  - name: Admin
+    description: Admin-only management and analytics callables.
+  - name: Leaderboard
+    description: Touhou leaderboard and score submission endpoints.
+  - name: IdentityToolkit
+    description: Firebase Identity Toolkit token/account lookup endpoint.
+paths:
+  /startUnityAuth:
+    post:
+      tags: [UnityAuth]
+      operationId: startUnityAuth
+      summary: Create Unity auth session
+      description: |
+        Creates a browser-mediated authentication session for Unity/local clients.
+
+        Installer behavior:
+        - Sends callable-style JSON envelope `{"data":{"version":"<targetVersion>"}}`.
+        - Uses the returned `result.sessionId` to open the web auth page on `pro.poiyomi.com`.
+        - Retries once with explicit IPv4 resolution when the first attempt fails with DNS/name-resolution errors.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartUnityAuthRequest"
+      responses:
+        "200":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartUnityAuthResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /checkUnityAuth:
+    post:
+      tags: [UnityAuth]
+      operationId: checkUnityAuth
+      summary: Poll Unity auth session status
+      description: |
+        Polls session state for a Unity auth session and returns `pending`, `completed`, or `failed`.
+
+        Installer behavior:
+        - Poll interval starts at 2 seconds.
+        - If `result.shouldSlowDown=true`, polling is increased to 5 seconds.
+        - Polling stops on `completed` (uses `downloadUrl`) or `failed` (shows `error` to user).
+        - Maximum wait is 150 attempts (about 5 minutes at base interval before slow-down).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckUnityAuthRequest"
+      responses:
+        "200":
+          description: Session status result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckUnityAuthResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /getLatestRelease:
+    post:
+      tags: [Releases]
+      operationId: getLatestRelease
+      summary: Fetch latest releases
+      description: Returns latest release entries with assets used by the downloads page.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLatestReleaseRequest"
+      responses:
+        "200":
+          description: Release list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetLatestReleaseResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /generateDownloadUrl:
+    post:
+      tags: [Releases]
+      operationId: generateDownloadUrl
+      summary: Generate signed download URL for an asset
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateDownloadUrlRequest"
+      responses:
+        "200":
+          description: URL generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateDownloadUrlResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /handlePatreonCallback:
+    post:
+      tags: [PatreonAuth]
+      operationId: handlePatreonCallback
+      summary: Exchange Patreon OAuth code and complete sign-in
+      description: |
+        Handles Patreon OAuth callback, creates/updates user state, and returns
+        a Firebase custom token and entitlement status.
+
+        Web callback flow (`/auth/callback`) to recreate login:
+        - Read Patreon `code` and `state` query params.
+        - Validate `state` against `sessionStorage.oauth_session_id`.
+        - Call this endpoint with `data.code=<code>` and `data.sessionId=<state>`.
+        - Sign in with returned `result.customToken`.
+        - Branch UX from `result.status` (`active_patron`/`admin`, `insufficient_tier`, `not_a_patron`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandlePatreonCallbackRequest"
+      responses:
+        "200":
+          description: Callback handled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HandlePatreonCallbackResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /completeUnityAuthDirect:
+    post:
+      tags: [UnityAuth, PatreonAuth]
+      operationId: completeUnityAuthDirect
+      summary: Complete Unity auth for already-authenticated browser session
+      description: |
+        Completes a Unity auth session when browser already has an authenticated account.
+
+        Web behavior (`/unity-auth`):
+        - After session validation, if the browser user is authenticated and has download access/admin,
+          the app calls this endpoint with the Unity `sessionId`.
+        - Success redirects browser to `/unity-success?sessionId=<sessionId>`, which signals the Unity-side poller.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteUnityAuthDirectRequest"
+      responses:
+        "200":
+          description: Session completion result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteUnityAuthDirectResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /linkPatreonAccount:
+    post:
+      tags: [Account, PatreonAuth]
+      operationId: linkPatreonAccount
+      summary: Link Patreon account to current user
+      description: |
+        Links Patreon identity to an already-authenticated web account.
+
+        Web behavior (`/auth/patreon-link-callback`):
+        - Account page stores `localStorage.patreon_link_session=<state>` and opens Patreon OAuth popup.
+        - Callback validates query `state` against `patreon_link_session`, then calls this endpoint with `data.code`.
+        - On callback failure, UI stores `localStorage.patreon_link_error` for account page display.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LinkPatreonAccountRequest"
+      responses:
+        "200":
+          description: Linking result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinkPatreonAccountResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /unlinkPatreonAccount:
+    post:
+      tags: [Account]
+      operationId: unlinkPatreonAccount
+      summary: Unlink Patreon account from current user
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnlinkPatreonAccountRequest"
+      responses:
+        "200":
+          description: Unlink result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnlinkPatreonAccountResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /searchUsers:
+    post:
+      tags: [Admin]
+      operationId: searchUsers
+      summary: Search users for admin workflows
+      description: Admin-only callable used to search users by query.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchUsersRequest"
+      responses:
+        "200":
+          description: Search result set
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchUsersResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /grantSpecialAccess:
+    post:
+      tags: [Admin]
+      operationId: grantSpecialAccess
+      summary: Grant special download access
+      description: Admin-only callable for special-access grants.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantSpecialAccessRequest"
+      responses:
+        "200":
+          description: Grant result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GrantSpecialAccessResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /revokeSpecialAccess:
+    post:
+      tags: [Admin]
+      operationId: revokeSpecialAccess
+      summary: Revoke special download access
+      description: Admin-only callable for special-access revocation.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeSpecialAccessRequest"
+      responses:
+        "200":
+          description: Revocation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeSpecialAccessResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /getLeaderboardUsers:
+    post:
+      tags: [Admin, Leaderboard]
+      operationId: getLeaderboardUsers
+      summary: Fetch leaderboard users for admin tooling
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLeaderboardUsersRequest"
+      responses:
+        "200":
+          description: Leaderboard users
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetLeaderboardUsersResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /getAdminStats:
+    post:
+      tags: [Admin]
+      operationId: getAdminStats
+      summary: Fetch aggregate admin analytics
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetAdminStatsRequest"
+      responses:
+        "200":
+          description: Analytics payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetAdminStatsResponse"
+        default:
+          $ref: "#/components/responses/CallableError"
+  /submitTouhouScoreV2:
+    post:
+      tags: [Leaderboard]
+      operationId: submitTouhouScoreV2
+      summary: Submit Touhou mini-game score
+      description: |
+        Direct HTTP endpoint used by the home page game (not callable envelope).
+        The current web client only submits when the user is authenticated and has
+        beaten their existing leaderboard score.
+      security:
+        - bearerAuth: []
+      requestBody:
+        description: |
+          Client payload is built as `{"score": Math.floor(currentScore), "validation": {...}}`.
+          The `validation` object contains gameplay telemetry used for server-side checks.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitTouhouScoreRequest"
+            example:
+              score: 187
+              validation:
+                checkpoints: [0, 100]
+                mouseMoves: 87
+                gameTime: 1874.32
+                hash: MTAwLTI4NT
+      responses:
+        "200":
+          description: Submission accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitTouhouScoreResponse"
+        default:
+          description: Error response (shape may vary by implementation)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LooseErrorEnvelope"
+  /accounts:lookup:
+    post:
+      tags: [IdentityToolkit]
+      operationId: accountsLookup
+      summary: Lookup Firebase account from ID token
+      description: Google Identity Toolkit endpoint observed in browser traffic.
+      servers:
+        - url: https://identitytoolkit.googleapis.com/v1
+          description: Google Identity Toolkit REST API
+      security:
+        - identityApiKey: []
+      parameters:
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Web API key for Firebase project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountsLookupRequest"
+      responses:
+        "200":
+          description: Account lookup data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountsLookupResponse"
+        default:
+          description: Identity Toolkit error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityToolkitErrorResponse"
+components:
+  responses:
+    CallableError:
+      description: Firebase callable error envelope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CallableErrorEnvelope"
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Firebase ID token bearer auth.
+    identityApiKey:
+      type: apiKey
+      in: query
+      name: key
+      description: Google Identity Toolkit API key.
+  schemas:
+    CallableErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message]
+          properties:
+            status:
+              type: string
+            message:
+              type: string
+            details: {}
+          additionalProperties: true
+      additionalProperties: true
+    LooseErrorEnvelope:
+      type: object
+      properties:
+        error:
+          oneOf:
+            - type: string
+            - type: object
+      additionalProperties: true
+    IdOrNumericId:
+      oneOf:
+        - type: string
+        - type: integer
+    StartUnityAuthRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [version]
+          properties:
+            version:
+              type: string
+          additionalProperties: false
+      additionalProperties: false
+    StartUnityAuthResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [sessionId]
+          properties:
+            sessionId:
+              type: string
+          additionalProperties: false
+      additionalProperties: false
+    CheckUnityAuthRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [sessionId]
+          properties:
+            sessionId:
+              type: string
+          additionalProperties: false
+      additionalProperties: false
+    CheckUnityAuthResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [pending, completed, failed]
+              description: |
+                Session state observed by the Unity installer:
+                - `pending`: browser auth not finished yet
+                - `completed`: auth/entitlement checks passed; `downloadUrl` should be present
+                - `failed`: auth/entitlement failed; `error` should explain why
+            downloadUrl:
+              type: string
+              format: uri
+              description: Signed package URL consumed by the installer when `status=completed`.
+            error:
+              type: string
+              description: |
+                Failure reason/message when `status=failed`.
+                Observed installer-specific values include `insufficient_tier` and `not_a_patron`.
+            pollCount:
+              type: integer
+              minimum: 0
+              description: Number of server-side poll checks performed for this session.
+            shouldSlowDown:
+              type: boolean
+              description: Client hint to reduce polling frequency (installer switches from 2s to 5s).
+          additionalProperties: true
+      additionalProperties: false
+    GetLatestReleaseRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [limit]
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+          additionalProperties: false
+      additionalProperties: false
+    GetLatestReleaseResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: array
+          items:
+            $ref: "#/components/schemas/Release"
+      additionalProperties: false
+    Release:
+      type: object
+      properties:
+        id:
+          $ref: "#/components/schemas/IdOrNumericId"
+        tag_name:
+          type: string
+        name:
+          type: string
+        published_at:
+          type: string
+          format: date-time
+        body:
+          type: string
+        assets:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReleaseAsset"
+      required: [assets]
+      additionalProperties: true
+    ReleaseAsset:
+      type: object
+      required: [id, name, size]
+      properties:
+        id:
+          $ref: "#/components/schemas/IdOrNumericId"
+        name:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+      additionalProperties: true
+    GenerateDownloadUrlRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [releaseId, assetId]
+          properties:
+            releaseId:
+              $ref: "#/components/schemas/IdOrNumericId"
+            assetId:
+              $ref: "#/components/schemas/IdOrNumericId"
+          additionalProperties: false
+      additionalProperties: false
+    GenerateDownloadUrlResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [url]
+          properties:
+            url:
+              type: string
+              format: uri
+          additionalProperties: true
+      additionalProperties: false
+    HandlePatreonCallbackRequest:
+      type: object
+      description: Payload sent by `/auth/callback` after Patreon redirects with `code` + `state`.
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [code, sessionId]
+          properties:
+            code:
+              type: string
+              description: Patreon OAuth authorization code from callback query `code`.
+            sessionId:
+              type: string
+              description: Callback `state` value; must match `sessionStorage.oauth_session_id`.
+              pattern: "^[a-zA-Z0-9-]{10,50}$"
+          additionalProperties: false
+      additionalProperties: false
+    HandlePatreonCallbackResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [status, customToken]
+          properties:
+            status:
+              type: string
+              enum: [active_patron, admin, insufficient_tier, not_a_patron]
+              description: Determines post-login routing (`/success`, `/upgrade-tier`, or `/not-a-patron`).
+            customToken:
+              type: string
+              description: Firebase custom token used by web client sign-in.
+            tier:
+              type: string
+              description: Patreon tier label/value used when redirecting to `/upgrade-tier`.
+            hasDownloadAccess:
+              type: boolean
+          additionalProperties: true
+      additionalProperties: false
+    CompleteUnityAuthDirectRequest:
+      type: object
+      description: Payload used by `/unity-auth` to finalize Unity session server-side.
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [sessionId]
+          properties:
+            sessionId:
+              type: string
+              description: Unity auth session id from `/unity-auth?sessionId=...`.
+          additionalProperties: false
+      additionalProperties: false
+    CompleteUnityAuthDirectResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          properties:
+            success:
+              type: boolean
+            status:
+              type: string
+            downloadUrl:
+              type: string
+              format: uri
+            error:
+              type: string
+          additionalProperties: true
+      additionalProperties: false
+    LinkPatreonAccountRequest:
+      type: object
+      description: Payload sent by `/auth/patreon-link-callback` after Patreon OAuth popup returns.
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [code]
+          properties:
+            code:
+              type: string
+              description: Patreon OAuth authorization code from callback query `code`.
+          additionalProperties: false
+      additionalProperties: false
+    LinkPatreonAccountResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [success]
+          properties:
+            success:
+              type: boolean
+            hasAccess:
+              type: boolean
+            patreonName:
+              type: string
+          additionalProperties: true
+      additionalProperties: false
+    UnlinkPatreonAccountRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+      additionalProperties: false
+    UnlinkPatreonAccountResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          properties:
+            success:
+              type: boolean
+          additionalProperties: true
+      additionalProperties: false
+    SearchUsersRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [query, limit]
+          properties:
+            query:
+              type: string
+            limit:
+              type: integer
+              minimum: 1
+            orderBy:
+              type: string
+              description: Observed value `creationTime`.
+          additionalProperties: false
+      additionalProperties: false
+    SearchUsersResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [success, users]
+          properties:
+            success:
+              type: boolean
+            users:
+              type: array
+              items:
+                $ref: "#/components/schemas/AuthUserSummary"
+          additionalProperties: true
+      additionalProperties: false
+    AuthUserSummary:
+      type: object
+      required: [uid]
+      properties:
+        uid:
+          type: string
+        displayName:
+          type: [string, "null"]
+        email:
+          type: [string, "null"]
+        photoURL:
+          type: [string, "null"]
+          format: uri
+        creationTime:
+          type: string
+          format: date-time
+        customClaims:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    GrantSpecialAccessRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [patreonId]
+          properties:
+            patreonId:
+              type: string
+            firebaseUid:
+              type: string
+            name:
+              type: string
+            reason:
+              type: string
+            expiresAt:
+              type: string
+              format: date-time
+          additionalProperties: false
+      additionalProperties: false
+    GrantSpecialAccessResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          properties:
+            success:
+              type: boolean
+            claimsUpdated:
+              type: boolean
+          additionalProperties: true
+      additionalProperties: false
+    RevokeSpecialAccessRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [patreonId]
+          properties:
+            patreonId:
+              type: string
+          additionalProperties: false
+      additionalProperties: false
+    RevokeSpecialAccessResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          properties:
+            success:
+              type: boolean
+          additionalProperties: true
+      additionalProperties: false
+    GetLeaderboardUsersRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+      additionalProperties: false
+    GetLeaderboardUsersResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          required: [success, users]
+          properties:
+            success:
+              type: boolean
+            users:
+              type: array
+              items:
+                $ref: "#/components/schemas/LeaderboardUser"
+          additionalProperties: true
+      additionalProperties: false
+    LeaderboardUser:
+      type: object
+      required: [docId, score]
+      properties:
+        docId:
+          type: string
+        userId:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        photoURL:
+          type: string
+          format: uri
+        patreonId:
+          type: string
+        score:
+          type: number
+        timestamp:
+          type: string
+          format: date-time
+        hasSpecialAccess:
+          type: boolean
+      additionalProperties: true
+    GetAdminStatsRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [timeRange, type]
+          properties:
+            timeRange:
+              type: string
+            type:
+              type: string
+              enum: [overview]
+          additionalProperties: false
+      additionalProperties: false
+    GetAdminStatsResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          $ref: "#/components/schemas/AdminStats"
+      additionalProperties: false
+    AdminStats:
+      type: object
+      required:
+        - overview
+        - authStats
+        - downloadStats
+        - errorStats
+      properties:
+        overview:
+          type: object
+          properties:
+            totalUsers:
+              type: integer
+            activeUsers:
+              type: integer
+            totalDownloadsAllTime:
+              type: integer
+            totalDownloads:
+              type: integer
+            errorRate:
+              type: integer
+            activeUsersToday:
+              type: integer
+            downloadsToday:
+              type: integer
+            authSuccessToday:
+              type: integer
+          additionalProperties: true
+        authStats:
+          type: object
+          properties:
+            success:
+              type: integer
+            total:
+              type: integer
+            failed:
+              type: integer
+            failureReasons:
+              type: object
+              additionalProperties:
+                type: integer
+          additionalProperties: true
+        downloadStats:
+          type: object
+          properties:
+            total:
+              type: integer
+            versionBreakdown:
+              type: object
+              additionalProperties:
+                type: integer
+          additionalProperties: true
+        errorStats:
+          type: object
+          properties:
+            total:
+              type: integer
+            byFunction:
+              type: object
+              additionalProperties:
+                type: integer
+          additionalProperties: true
+        tierDistribution:
+          type: object
+          additionalProperties:
+            type: integer
+        functionStats:
+          type: object
+          additionalProperties:
+            type: integer
+      additionalProperties: true
+    SubmitTouhouScoreRequest:
+      type: object
+      description: |
+        Score submission payload emitted by the home page Touhou mini-game.
+        `score` is the floored final score, while `validation` is sampled from runtime telemetry.
+      required: [score, validation]
+      properties:
+        score:
+          type: integer
+          minimum: 0
+          description: Final score sent as `Math.floor(currentScore)` at submit time.
+        validation:
+          type: object
+          description: Runtime gameplay telemetry captured during a single run.
+          required: [checkpoints, mouseMoves, gameTime, hash]
+          properties:
+            checkpoints:
+              type: array
+              description: |
+                Starts as `[0]` and appends `Math.floor(elapsed * 0.1)` when
+                `elapsed % 1000 < 16` (once per ~1-second rAF window).
+                Score rate is 0.1 pts/ms (100 pts/sec), so values are
+                roughly `[0, 100, 200, ...]`.
+              items:
+                type: integer
+            mouseMoves:
+              type: integer
+              minimum: 0
+              description: >
+                Counter incremented per `requestAnimationFrame` when cursor
+                delta exceeds 2px on either axis.
+            gameTime:
+              type: number
+              minimum: 0
+              description: >
+                Elapsed run duration in milliseconds (`performance.now()` delta),
+                sent as a float. Relationship: `score = Math.floor(gameTime * 0.1)`.
+            hash:
+              type: string
+              description: >
+                Anti-tamper token refreshed on checkpoint ticks as
+                `btoa(`${scoreAtTick}-${rAFTimestamp}-touhou-game-2024`).substring(0, 10)`,
+                where `scoreAtTick` is the current score at checkpoint time and
+                `rAFTimestamp` is the absolute `requestAnimationFrame` DOMHighResTimeStamp.
+          additionalProperties: true
+      additionalProperties: false
+    SubmitTouhouScoreResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        rank:
+          type: integer
+        message:
+          type: string
+      additionalProperties: true
+    AccountsLookupRequest:
+      type: object
+      required: [idToken]
+      properties:
+        idToken:
+          type: string
+      additionalProperties: false
+    AccountsLookupResponse:
+      type: object
+      properties:
+        kind:
+          type: string
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/IdentityToolkitUser"
+      additionalProperties: true
+    IdentityToolkitUser:
+      type: object
+      properties:
+        localId:
+          type: string
+        email:
+          type: string
+        emailVerified:
+          type: boolean
+        displayName:
+          type: string
+        photoUrl:
+          type: string
+          format: uri
+        createdAt:
+          type: string
+        lastLoginAt:
+          type: string
+        customAuth:
+          type: boolean
+      additionalProperties: true
+    IdentityToolkitErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  domain:
+                    type: string
+                  reason:
+                    type: string
+                additionalProperties: true
+          additionalProperties: true
+      additionalProperties: true

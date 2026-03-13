@@ -143,7 +143,9 @@ paths:
     post:
       tags: [Releases]
       operationId: generateDownloadUrl
-      summary: Generate signed download URL for an asset
+      summary: Generate signed download URL for an asset.
+      description: |
+        Generates a signed download URL for a given release asset. The URL is valid for 1 hour.
       security:
         - bearerAuth: []
       requestBody:
@@ -564,7 +566,7 @@ components:
             downloadUrl:
               type: string
               format: uri
-              description: Signed package URL consumed by the installer when `status=completed`.
+              description: Signed package URL consumed by the installer when `status=completed`. Valid for 1 hour.
             error:
               type: string
               description: |

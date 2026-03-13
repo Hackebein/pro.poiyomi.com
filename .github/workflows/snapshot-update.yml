@@ -1,0 +1,34 @@
+name: Hourly Poiyomi Monitor
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Capture snapshot
+        run: ./scripts/snapshot.sh
+
+      - name: Commit and push when dist changes
+        run: |
+          if [ -n "$(git status --porcelain dist)" ]; then
+            git add dist
+            git commit -m "chore: refresh poiyomi snapshot"
+            git push
+          else
+            echo "No changes in dist/"
+          fi

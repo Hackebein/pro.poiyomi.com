@@ -1,0 +1,26 @@
+name: OpenAPI Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - openapi.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create release for OpenAPI
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openapi-${{ github.sha }}
+          name: OpenAPI ${{ github.sha }}
+          files: openapi.yaml

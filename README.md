@@ -1,6 +1,8 @@
-# Poiyomi Pro Monitor
+# pro.poiyomi.com
 
-This project tracks changes on Poiyomi by combining:
+This repository tracks changes to `https://pro.poiyomi.com/` by maintaining:
 
-- An regular website snapshot of `https://pro.poiyomi.com/` into `dist/`
-- A reverse-engineered OpenAPI document in `openapi.yaml` (may lag behind upstream production changes)
+- A regular snapshot of the website in `dist/`
+- A reverse-engineered OpenAPI spec in `openapi.yaml` that may lag behind production
+
+It also contains research on how the Touhou games integration works `submit-touhou.js`.
